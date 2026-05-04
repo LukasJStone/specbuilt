@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::Path;
+use crate::extract_dart;
 use crate::extract_ts;
 
 /// Generate a compilable stub module file from a .sb spec file.
@@ -247,6 +248,85 @@ pub fn generate_ts_stub_crate(spec_path: &Path, output_dir: &Path) -> Result<()>
 
     println!(
         "Generated TypeScript stub for '{}' -> {}",
+        spec.package.name,
+        pkg_dir.display()
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Flutter/Dart stubs
+// ---------------------------------------------------------------------------
+
+/// Generate stub Dart source from an api_surface string.
+fn dart_stub_source(spec: &crate::SpecFile) -> String {
+    if spec.interface.api_surface.is_empty() {
+        "// Empty stub — no public API surface extracted\n".to_string()
+    } else {
+        extract_dart::make_dart_stub(&spec.interface.api_surface)
+    }
+}
+
+/// Generate a compilable Flutter/Dart stub module file from a .sb spec.
+/// Writes a single `.dart` file.
+pub fn generate_flutter_module_stub(spec_path: &Path, output_path: &Path) -> Result<()> {
+    let content = fs::read_to_string(spec_path)
+        .with_context(|| format!("Failed to read spec: {}", spec_path.display()))?;
+    let spec: crate::SpecFile = toml::from_str(&content)
+        .with_context(|| format!("Failed to parse spec: {}", spec_path.display()))?;
+
+    let stub_src = dart_stub_source(&spec);
+
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    fs::write(output_path, stub_src)
+        .with_context(|| format!("Failed to write Dart stub: {}", output_path.display()))?;
+
+    println!(
+        "Generated Flutter module stub for '{}' -> {}",
+        spec.package.name,
+        output_path.display()
+    );
+    Ok(())
+}
+
+/// Generate a compilable Flutter/Dart stub package from a .sb spec.
+/// Writes `output_dir/<name>/lib/<name>.dart` and `output_dir/<name>/pubspec.yaml`.
+pub fn generate_flutter_stub_crate(spec_path: &Path, output_dir: &Path) -> Result<()> {
+    let content = fs::read_to_string(spec_path)
+        .with_context(|| format!("Failed to read spec: {}", spec_path.display()))?;
+    let spec: crate::SpecFile = toml::from_str(&content)
+        .with_context(|| format!("Failed to parse spec: {}", spec_path.display()))?;
+
+    let stub_src = dart_stub_source(&spec);
+
+    let pkg_dir = output_dir.join(&spec.package.name);
+    let lib_dir = pkg_dir.join("lib");
+    fs::create_dir_all(&lib_dir)?;
+
+    let dart_file = lib_dir.join(format!("{}.dart", spec.package.name));
+    fs::write(&dart_file, stub_src)
+        .with_context(|| format!("Failed to write {}", dart_file.display()))?;
+
+    let version = if spec.package.version.is_empty() {
+        "0.0.1".to_string()
+    } else {
+        spec.package.version.clone()
+    };
+
+    let pubspec = format!(
+        "name: {}\nversion: {}\ndescription: {}\n\nenvironment:\n  sdk: '>=2.19.0 <4.0.0'\n",
+        spec.package.name,
+        version,
+        spec.package.description
+    );
+    fs::write(pkg_dir.join("pubspec.yaml"), pubspec)
+        .with_context(|| format!("Failed to write pubspec.yaml in {}", pkg_dir.display()))?;
+
+    println!(
+        "Generated Flutter stub for '{}' -> {}",
         spec.package.name,
         pkg_dir.display()
     );

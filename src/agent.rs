@@ -588,7 +588,7 @@ The codebase is organized into packages. Each package is either:
 - CLOSED: represented by a `.sb` spec file (a lightweight contract with interface, dependencies, and behavioral spec)
 - OPEN: full source code is available for editing
 
-Packages may be written in Rust or TypeScript (indicated by `[package].language` in the .sb spec).
+Packages may be written in Rust, TypeScript, or Flutter/Dart (indicated by `[package].language` in the .sb spec).
 
 Your task is to modify the opened package according to the user's instructions.
 
@@ -606,11 +606,12 @@ Workflow:
 3. Make the necessary changes
 4. For Rust: run `cargo test` or `cargo check` to verify
    For TypeScript: run `npm test`, `tsc --noEmit`, or the command in `[test].command`
+   For Flutter/Dart: run `flutter test`, `dart analyze`, or the command in `[test].command`
 5. Iterate until everything passes
 
 Rules:
 - Only modify files within the opened package unless explicitly asked
-- Follow the idiomatic style of the package language (Rust or TypeScript)
+- Follow the idiomatic style of the package language (Rust, TypeScript, or Flutter/Dart)
 - Maintain compatibility with the package's public API as described in the spec
 - Do not break existing tests unless the spec explicitly requires a behavior change"#
     )
