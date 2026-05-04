@@ -173,6 +173,15 @@ fn transform_impl_block(text: &str) -> String {
 // TypeScript stubs
 // ---------------------------------------------------------------------------
 
+/// Generate stub TypeScript source from an api_surface string.
+fn ts_stub_source(spec: &crate::SpecFile) -> String {
+    if spec.interface.api_surface.is_empty() {
+        "// Empty stub — no public API surface extracted\nexport {};\n".to_string()
+    } else {
+        extract_ts::make_ts_compilable(&spec.interface.api_surface)
+    }
+}
+
 /// Generate a compilable TypeScript stub module file from a .sb spec.
 /// Writes a single `.ts` file.
 pub fn generate_ts_module_stub(spec_path: &Path, output_path: &Path) -> Result<()> {
@@ -181,11 +190,7 @@ pub fn generate_ts_module_stub(spec_path: &Path, output_path: &Path) -> Result<(
     let spec: crate::SpecFile = toml::from_str(&content)
         .with_context(|| format!("Failed to parse spec: {}", spec_path.display()))?;
 
-    let stub_src = if spec.interface.api_surface.is_empty() {
-        "// Empty stub — no public API surface extracted\nexport {};\n".to_string()
-    } else {
-        extract_ts::make_ts_compilable(&spec.interface.api_surface)
-    };
+    let stub_src = ts_stub_source(&spec);
 
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent)?;
@@ -210,11 +215,7 @@ pub fn generate_ts_stub_crate(spec_path: &Path, output_dir: &Path) -> Result<()>
     let spec: crate::SpecFile = toml::from_str(&content)
         .with_context(|| format!("Failed to parse spec: {}", spec_path.display()))?;
 
-    let stub_src = if spec.interface.api_surface.is_empty() {
-        "// Empty stub — no public API surface extracted\nexport {};\n".to_string()
-    } else {
-        extract_ts::make_ts_compilable(&spec.interface.api_surface)
-    };
+    let stub_src = ts_stub_source(&spec);
 
     let pkg_dir = output_dir.join(&spec.package.name);
     fs::create_dir_all(&pkg_dir)?;

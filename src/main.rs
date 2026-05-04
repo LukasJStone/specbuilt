@@ -344,6 +344,9 @@ struct AiCheckResult {
 
 const SB_EXT: &str = ".sb";
 const SPEC_HIDDEN: &str = ".specbuilt.sb";
+const RUST_SOURCE_EXTS: &[&str] = &["rs"];
+const TS_SOURCE_EXTS: &[&str] = &["ts", "tsx"];
+const ALL_SOURCE_EXTS: &[&str] = &["rs", "ts", "tsx"];
 
 /// Returns true if the spec declares this package as a TypeScript package.
 fn is_typescript(spec: &SpecFile) -> bool {
@@ -488,7 +491,7 @@ fn hash_bytes(data: &[u8]) -> String {
 }
 
 fn hash_source_dir(path: &Path) -> Result<String> {
-    hash_source_dir_exts(path, &["rs", "ts", "tsx"])
+    hash_source_dir_exts(path, ALL_SOURCE_EXTS)
 }
 
 fn hash_source_dir_exts(path: &Path, exts: &[&str]) -> Result<String> {
@@ -527,7 +530,7 @@ fn file_mtime(path: &Path) -> Result<u64> {
 }
 
 fn max_mtime_source(path: &Path) -> Result<u64> {
-    max_mtime_source_exts(path, &["rs", "ts", "tsx"])
+    max_mtime_source_exts(path, ALL_SOURCE_EXTS)
 }
 
 fn max_mtime_source_exts(path: &Path, exts: &[&str]) -> Result<u64> {
@@ -1939,7 +1942,8 @@ fn base_workspace(app_dir: &Path) -> Result<()> {
 
     if generated == 0 {
         anyhow::bail!(
-            "No Rust crates or TypeScript packages found in {}",
+            "No Rust crates or TypeScript packages found in {}.\n\
+            Check that each subdirectory contains either a Cargo.toml (Rust) or a package.json (TypeScript).",
             source_dir.display()
         );
     }
@@ -2086,11 +2090,11 @@ fn backup_package(pkg_dir: &Path, app_dir: &Path) -> Result<PathBuf> {
 }
 
 fn clear_rs_files(dir: &Path) -> Result<usize> {
-    clear_source_files_by_ext(dir, &["rs"])
+    clear_source_files_by_ext(dir, RUST_SOURCE_EXTS)
 }
 
 fn clear_ts_files(dir: &Path) -> Result<usize> {
-    clear_source_files_by_ext(dir, &["ts", "tsx"])
+    clear_source_files_by_ext(dir, TS_SOURCE_EXTS)
 }
 
 fn clear_source_files_by_ext(dir: &Path, exts: &[&str]) -> Result<usize> {
@@ -2623,14 +2627,18 @@ fn main() -> Result<()> {
             } else {
                 for pkg in &closed {
                     let sb_path = app_dir.join(format!("{}{}", pkg, SB_EXT));
-                    if let Ok(spec) = read_spec(&sb_path) {
-                        if is_typescript(&spec) {
-                            stub::generate_ts_stub_crate(&sb_path, &out_dir)?;
-                        } else {
+                    match read_spec(&sb_path) {
+                        Ok(spec) => {
+                            if is_typescript(&spec) {
+                                stub::generate_ts_stub_crate(&sb_path, &out_dir)?;
+                            } else {
+                                stub::generate_stub_crate(&sb_path, &out_dir)?;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("  [stub] Warning: failed to read spec for '{}': {}", pkg, e);
                             stub::generate_stub_crate(&sb_path, &out_dir)?;
                         }
-                    } else {
-                        stub::generate_stub_crate(&sb_path, &out_dir)?;
                     }
                 }
             }

@@ -58,9 +58,14 @@ pub fn build_index(source_dir: &Path) -> Result<SymbolIndex> {
             }
         } else if pkg_dir.join("package.json").exists() {
             println!("  [index] Indexing TypeScript package '{}'...", pkg_name);
-            let symbols = index_ts_package(&pkg_dir, &pkg_name);
-            if !symbols.is_empty() {
-                index.crates.insert(pkg_name, symbols);
+            match index_ts_package(&pkg_dir, &pkg_name) {
+                Ok(symbols) if !symbols.is_empty() => {
+                    index.crates.insert(pkg_name, symbols);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("  [index] Warning: failed to index '{}': {}", pkg_name, e);
+                }
             }
         }
     }
@@ -357,7 +362,7 @@ fn extract_docs(attrs: &[syn::Attribute]) -> String {
 // ---------------------------------------------------------------------------
 
 /// Index all `.ts` / `.tsx` files in a TypeScript package directory.
-fn index_ts_package(pkg_dir: &Path, pkg_name: &str) -> Vec<Symbol> {
+fn index_ts_package(pkg_dir: &Path, pkg_name: &str) -> Result<Vec<Symbol>> {
     let search_root = {
         let src = pkg_dir.join("src");
         if src.is_dir() { src } else { pkg_dir.to_path_buf() }
@@ -394,7 +399,7 @@ fn index_ts_package(pkg_dir: &Path, pkg_name: &str) -> Vec<Symbol> {
         }
     }
 
-    symbols
+    Ok(symbols)
 }
 
 fn index_ts_file(path: &Path, pkg_name: &str, rel_path: &str) -> Result<Vec<Symbol>> {
