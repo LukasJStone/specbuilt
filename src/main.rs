@@ -9,6 +9,7 @@ use std::time::SystemTime;
 
 mod agent;
 mod extract;
+mod extract_ts;
 mod index;
 mod stub;
 
@@ -216,6 +217,9 @@ struct PackageSpec {
     version: String,
     #[serde(default)]
     description: String,
+    /// "rust" (default) or "typescript" / "ts"
+    #[serde(default)]
+    language: String,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -273,6 +277,20 @@ struct CargoPackage {
     description: String,
 }
 
+/// Minimal package.json parsing for base command (TypeScript packages)
+#[derive(Debug, Deserialize)]
+struct PackageJson {
+    name: String,
+    #[serde(default)]
+    version: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    dependencies: serde_json::Map<String, serde_json::Value>,
+    #[serde(rename = "devDependencies", default)]
+    dev_dependencies: serde_json::Map<String, serde_json::Value>,
+}
+
 // ---------------------------------------------------------------------------
 // Check database types
 // ---------------------------------------------------------------------------
@@ -326,6 +344,17 @@ struct AiCheckResult {
 
 const SB_EXT: &str = ".sb";
 const SPEC_HIDDEN: &str = ".specbuilt.sb";
+const RUST_SOURCE_EXTS: &[&str] = &["rs"];
+const TS_SOURCE_EXTS: &[&str] = &["ts", "tsx"];
+const ALL_SOURCE_EXTS: &[&str] = &["rs", "ts", "tsx"];
+
+/// Returns true if the spec declares this package as a TypeScript package.
+fn is_typescript(spec: &SpecFile) -> bool {
+    matches!(
+        spec.package.language.to_ascii_lowercase().as_str(),
+        "typescript" | "ts"
+    )
+}
 
 fn get_app_dir(app_dir: Option<PathBuf>) -> Result<PathBuf> {
     let dir = match app_dir {
@@ -462,12 +491,22 @@ fn hash_bytes(data: &[u8]) -> String {
 }
 
 fn hash_source_dir(path: &Path) -> Result<String> {
+    hash_source_dir_exts(path, ALL_SOURCE_EXTS)
+}
+
+fn hash_source_dir_exts(path: &Path, exts: &[&str]) -> Result<String> {
     let mut hasher = Sha256::new();
     let mut entries: Vec<_> = walkdir::WalkDir::new(path)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
-        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("rs"))
+        .filter(|e| {
+            e.path()
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(|ext| exts.iter().any(|x| *x == ext))
+                .unwrap_or(false)
+        })
         .map(|e| e.path().to_path_buf())
         .collect();
     entries.sort();
@@ -491,20 +530,30 @@ fn file_mtime(path: &Path) -> Result<u64> {
 }
 
 fn max_mtime_source(path: &Path) -> Result<u64> {
+    max_mtime_source_exts(path, ALL_SOURCE_EXTS)
+}
+
+fn max_mtime_source_exts(path: &Path, exts: &[&str]) -> Result<u64> {
     let mut max = 0u64;
     for entry in walkdir::WalkDir::new(path) {
         let entry = entry?;
-        if entry.file_type().is_file()
-            && entry.path().extension().and_then(|s| s.to_str()) == Some("rs")
-        {
-            if let Ok(meta) = entry.metadata() {
-                if let Ok(mtime) = meta.modified() {
-                    let secs = mtime
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    if secs > max {
-                        max = secs;
+        if entry.file_type().is_file() {
+            let ext_ok = entry
+                .path()
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(|ext| exts.iter().any(|x| *x == ext))
+                .unwrap_or(false);
+            if ext_ok {
+                if let Ok(meta) = entry.metadata() {
+                    if let Ok(mtime) = meta.modified() {
+                        let secs = mtime
+                            .duration_since(SystemTime::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        if secs > max {
+                            max = secs;
+                        }
                     }
                 }
             }
@@ -780,18 +829,23 @@ fn setup_temp_workspace(app_dir: &Path) -> Result<(PathBuf, Vec<String>)> {
         if name_str.ends_with(SB_EXT) {
             let pkg_name = name_str[..name_str.len() - SB_EXT.len()].to_string();
             let spec = read_spec(&entry.path())?;
-            packages.push((pkg_name, spec, false));
+            // Skip TypeScript packages — they don't belong in a Cargo workspace
+            if !is_typescript(&spec) {
+                packages.push((pkg_name, spec, false));
+            }
         } else if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             let hidden = entry.path().join(SPEC_HIDDEN);
             if hidden.exists() {
                 let spec = read_spec(&hidden)?;
-                packages.push((name_str.to_string(), spec, true));
+                if !is_typescript(&spec) {
+                    packages.push((name_str.to_string(), spec, true));
+                }
             }
         }
     }
 
     if packages.is_empty() {
-        anyhow::bail!("No packages found.");
+        anyhow::bail!("No Rust packages found to build.");
     }
 
     let temp_dir = app_dir.join(".specbuild-tmp");
@@ -839,6 +893,11 @@ fn run_checks(
     spec: &SpecFile,
     _source_path: &Path,
 ) -> Result<(CheckResult, String)> {
+    // TypeScript packages do not use cargo — route to the TS check path
+    if is_typescript(spec) {
+        return run_ts_checks(package, _source_path, spec);
+    }
+
     // 1. Spec validity check
     if spec.spec.invariants.is_empty() && spec.spec.verify_command.is_none() {
         return Ok((
@@ -930,6 +989,100 @@ fn run_checks(
                 CheckResult::Failed,
                 format!("AI check failed: {}", stdout.trim()),
             ));
+        }
+    }
+
+    Ok((CheckResult::Passed, "All checks passed".to_string()))
+}
+
+/// Check a TypeScript package: run `[test].command` and `[spec].verify_command`
+/// directly in the source directory (no cargo workspace required).
+fn run_ts_checks(
+    package: &str,
+    source_path: &Path,
+    spec: &SpecFile,
+) -> Result<(CheckResult, String)> {
+    // 1. Spec validity check
+    if spec.spec.invariants.is_empty() && spec.spec.verify_command.is_none() {
+        return Ok((
+            CheckResult::Bugged,
+            "No invariants or verify_command defined in spec".to_string(),
+        ));
+    }
+
+    for inv in &spec.spec.invariants {
+        if inv.trim().is_empty() {
+            return Ok((
+                CheckResult::Bugged,
+                "Empty invariant found in spec".to_string(),
+            ));
+        }
+    }
+
+    // 2. Run the test command from [test].command if provided
+    if !spec.test.command.is_empty() {
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&spec.test.command)
+            .current_dir(source_path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .with_context(|| format!("Failed to run test command: {}", spec.test.command))?;
+
+        if !output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let mut reason = format!("Tests failed for '{}'\n", package);
+            if !stdout.is_empty() {
+                reason.push_str(&format!("\nSTDOUT:\n{}", stdout));
+            }
+            if !stderr.is_empty() {
+                reason.push_str(&format!("\nSTDERR:\n{}", stderr));
+            }
+            return Ok((CheckResult::Failed, reason));
+        }
+    }
+
+    // 3. Run spec verify_command if present
+    if let Some(cmd_str) = &spec.spec.verify_command {
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(cmd_str)
+            .current_dir(source_path)
+            .output()
+            .with_context(|| format!("Failed to run verify_command: {}", cmd_str))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let reason = if !stderr.is_empty() {
+                format!("verify_command failed: {}", stderr.trim())
+            } else {
+                format!("verify_command failed: {}", stdout.trim())
+            };
+            return Ok((CheckResult::Failed, reason));
+        }
+    }
+
+    // 4. External AI checker
+    if let Ok(ai_checker) = std::env::var("SPECBUILD_AI_CHECKER") {
+        let output = std::process::Command::new(&ai_checker)
+            .arg(package)
+            .current_dir(source_path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .with_context(|| format!("Failed to run AI checker: {}", ai_checker))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if let Ok(ai_result) = serde_json::from_str::<AiCheckResult>(&stdout) {
+            return Ok((ai_result.result, ai_result.reason));
+        }
+        if output.status.success() {
+            return Ok((CheckResult::Passed, format!("AI check passed: {}", stdout.trim())));
+        } else {
+            return Ok((CheckResult::Failed, format!("AI check failed: {}", stdout.trim())));
         }
     }
 
@@ -1087,7 +1240,12 @@ fn close_package(package: &str, app_dir: &Path, regenerate: bool) -> Result<()> 
     // Optionally regenerate spec from updated source
     if regenerate {
         println!("  [close] Regenerating spec from source...");
-        match extract::extract_crate_api(&source_path) {
+        let api_result = if is_typescript(&spec) {
+            extract_ts::extract_ts_api(&source_path)
+        } else {
+            extract::extract_crate_api(&source_path)
+        };
+        match api_result {
             Ok(api_surface) => {
                 spec.interface.api_surface = api_surface;
                 println!("  [close] API surface regenerated");
@@ -1214,14 +1372,20 @@ fn close_module(path: &str, app_dir: &Path, _regenerate: bool) -> Result<()> {
         anyhow::bail!("Module '{}' is already closed ({} exists)", path, sb_path.display());
     }
 
-    // Extract API surface
-    let api_surface = match &location {
-        ModuleLocation::File(mod_path) => extract::extract_module_api(mod_path)?,
-        ModuleLocation::Directory(mod_path) => extract::extract_module_api(mod_path)?,
+    // Extract API surface (dispatch by language)
+    let crate_spec = read_spec(&crate_dir.join(SPEC_HIDDEN))?;
+    let api_surface = if is_typescript(&crate_spec) {
+        match &location {
+            ModuleLocation::File(mod_path) => extract_ts::extract_ts_module_api(mod_path)?,
+            ModuleLocation::Directory(mod_path) => extract_ts::extract_ts_module_api(mod_path)?,
+        }
+    } else {
+        match &location {
+            ModuleLocation::File(mod_path) => extract::extract_module_api(mod_path)?,
+            ModuleLocation::Directory(mod_path) => extract::extract_module_api(mod_path)?,
+        }
     };
 
-    // Determine canonical source path in specbuilt-source
-    let crate_spec = read_spec(&crate_dir.join(SPEC_HIDDEN))?;
     let canonical_crate_source = app_dir.join(&crate_spec.source.path);
     let rel_src_path = relative_path(&crate_dir, &mod_source_path)?;
     let canonical_module_source = canonical_crate_source.join(&rel_src_path);
@@ -1247,13 +1411,14 @@ fn close_module(path: &str, app_dir: &Path, _regenerate: bool) -> Result<()> {
         })?;
     }
 
-    // Build spec
+    // Build spec — inherit language from the parent crate spec
     let source_rel = relative_path(app_dir, &canonical_module_source)?;
     let spec = SpecFile {
         package: PackageSpec {
             name: module_segments.last().unwrap().to_string(),
             version: crate_spec.package.version.clone(),
             description: String::new(),
+            language: crate_spec.package.language.clone(),
         },
         interface: InterfaceSpec {
             inputs: Vec::new(),
@@ -1268,16 +1433,30 @@ fn close_module(path: &str, app_dir: &Path, _regenerate: bool) -> Result<()> {
 
     write_spec(&sb_path, &spec)?;
 
-    // Generate stub at original location
-    match &location {
-        ModuleLocation::File(mod_path) => {
-            stub::generate_module_stub(&sb_path, mod_path)?;
+    // Generate stub at original location (dispatch by language)
+    if is_typescript(&spec) {
+        match &location {
+            ModuleLocation::File(mod_path) => {
+                stub::generate_ts_module_stub(&sb_path, mod_path)?;
+            }
+            ModuleLocation::Directory(mod_path) => {
+                let mod_dir = mod_path.parent().unwrap();
+                let stub_path = mod_dir.with_extension("ts");
+                remove_dir_all_if_exists(mod_dir)?;
+                stub::generate_ts_module_stub(&sb_path, &stub_path)?;
+            }
         }
-        ModuleLocation::Directory(mod_path) => {
-            let mod_dir = mod_path.parent().unwrap();
-            let stub_path = mod_dir.with_extension("rs");
-            remove_dir_all_if_exists(mod_dir)?;
-            stub::generate_module_stub(&sb_path, &stub_path)?;
+    } else {
+        match &location {
+            ModuleLocation::File(mod_path) => {
+                stub::generate_module_stub(&sb_path, mod_path)?;
+            }
+            ModuleLocation::Directory(mod_path) => {
+                let mod_dir = mod_path.parent().unwrap();
+                let stub_path = mod_dir.with_extension("rs");
+                remove_dir_all_if_exists(mod_dir)?;
+                stub::generate_module_stub(&sb_path, &stub_path)?;
+            }
         }
     }
 
@@ -1440,24 +1619,108 @@ fn list_packages(app_dir: &Path) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn build_project(app_dir: &Path) -> Result<()> {
-    let (temp_dir, member_names) = setup_temp_workspace(app_dir)?;
+    // Separate Rust and TypeScript packages
+    let mut ts_packages: Vec<(String, PathBuf)> = Vec::new();
 
-    println!(
-        "Building {} package(s) in {}...",
-        member_names.len(),
-        temp_dir.display()
-    );
-    let status = std::process::Command::new("cargo")
-        .arg("build")
-        .arg("--workspace")
-        .current_dir(&temp_dir)
-        .status()
-        .with_context(|| "Failed to run cargo build. Is cargo installed?")?;
-
-    if !status.success() {
-        anyhow::bail!("cargo build failed");
+    for entry in fs::read_dir(app_dir)?.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.ends_with(SB_EXT) {
+            let pkg_name = name[..name.len() - SB_EXT.len()].to_string();
+            if let Ok(spec) = read_spec(&entry.path()) {
+                if is_typescript(&spec) {
+                    let src = app_dir.join(&spec.source.path);
+                    ts_packages.push((pkg_name, src));
+                }
+            }
+        } else if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            let hidden = entry.path().join(SPEC_HIDDEN);
+            if hidden.exists() {
+                if let Ok(spec) = read_spec(&hidden) {
+                    if is_typescript(&spec) {
+                        ts_packages.push((name, entry.path()));
+                    }
+                }
+            }
+        }
     }
-    println!("Build succeeded.");
+
+    // Build Rust packages using cargo temp workspace (best-effort — empty if no Rust pkgs)
+    let rust_result = setup_temp_workspace(app_dir);
+    match rust_result {
+        Ok((temp_dir, member_names)) => {
+            println!(
+                "Building {} Rust package(s) in {}...",
+                member_names.len(),
+                temp_dir.display()
+            );
+            let status = std::process::Command::new("cargo")
+                .arg("build")
+                .arg("--workspace")
+                .current_dir(&temp_dir)
+                .status()
+                .with_context(|| "Failed to run cargo build. Is cargo installed?")?;
+
+            if !status.success() {
+                anyhow::bail!("cargo build failed");
+            }
+            println!("Rust build succeeded.");
+        }
+        Err(e) => {
+            // No Rust packages — not an error if there are TS packages
+            if ts_packages.is_empty() {
+                return Err(e);
+            }
+            println!("  [build] No Rust packages to build.");
+        }
+    }
+
+    // Build TypeScript packages
+    for (name, src_path) in &ts_packages {
+        println!("Building TypeScript package '{}'...", name);
+        if !src_path.exists() {
+            eprintln!("  [build] Warning: source path does not exist for '{}'", name);
+            continue;
+        }
+        // Install deps if node_modules is absent
+        if !src_path.join("node_modules").exists() && src_path.join("package.json").exists() {
+            println!("  [build] Running npm install for '{}'...", name);
+            let status = std::process::Command::new("npm")
+                .arg("install")
+                .current_dir(src_path)
+                .status()
+                .with_context(|| format!("Failed to run npm install for '{}'", name))?;
+            if !status.success() {
+                eprintln!("  [build] npm install failed for '{}', continuing...", name);
+                continue;
+            }
+        }
+        // Run npm run build if a build script exists
+        let has_build_script = fs::read_to_string(src_path.join("package.json"))
+            .ok()
+            .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+            .and_then(|v| v.get("scripts").cloned())
+            .and_then(|s| s.get("build").cloned())
+            .is_some();
+
+        if has_build_script {
+            let status = std::process::Command::new("npm")
+                .arg("run")
+                .arg("build")
+                .current_dir(src_path)
+                .status()
+                .with_context(|| format!("Failed to run npm run build for '{}'", name))?;
+            if !status.success() {
+                anyhow::bail!("npm run build failed for '{}'", name);
+            }
+            println!("  TypeScript build succeeded for '{}'.", name);
+        } else {
+            println!(
+                "  [build] No build script in package.json for '{}'; skipping.",
+                name
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -1471,14 +1734,17 @@ pub fn discover_sb_dir(app_dir: &Path) -> Result<PathBuf> {
         .and_then(|n| n.to_str())
         .ok_or_else(|| anyhow::anyhow!("Cannot determine directory name"))?;
 
-    if !app_name.ends_with("-rs") {
+    let base_name = if let Some(b) = app_name.strip_suffix("-rs") {
+        b
+    } else if let Some(b) = app_name.strip_suffix("-ts") {
+        b
+    } else {
         anyhow::bail!(
-            "Expected current directory to end with '-rs' (e.g. 'application-rs'), got: {}",
+            "Expected current directory to end with '-rs' or '-ts' (e.g. 'application-rs' or 'application-ts'), got: {}",
             app_name
         );
-    }
+    };
 
-    let base_name = &app_name[..app_name.len() - 3];
     let sb_name = format!("{}-sb", base_name);
 
     let parent = app_dir
@@ -1513,7 +1779,12 @@ fn base_workspace(app_dir: &Path) -> Result<()> {
         );
     }
 
-    let mut crates: Vec<(String, CargoToml, PathBuf)> = Vec::new();
+    let mut generated = 0usize;
+
+    // -----------------------------------------------------------------------
+    // Rust crates (Cargo.toml present)
+    // -----------------------------------------------------------------------
+    let mut rust_crates: Vec<(String, CargoToml, PathBuf)> = Vec::new();
     for entry in fs::read_dir(&source_dir)?.flatten() {
         if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             let cargo_toml = entry.path().join("Cargo.toml");
@@ -1522,36 +1793,30 @@ fn base_workspace(app_dir: &Path) -> Result<()> {
                     .with_context(|| format!("Failed to read {}", cargo_toml.display()))?;
                 let cargo: CargoToml = toml::from_str(&content)
                     .with_context(|| format!("Failed to parse {}", cargo_toml.display()))?;
-                crates.push((cargo.package.name.clone(), cargo, entry.path()));
+                rust_crates.push((cargo.package.name.clone(), cargo, entry.path()));
             }
         }
     }
 
-    if crates.is_empty() {
-        anyhow::bail!("No Rust crates found in {}", source_dir.display());
-    }
+    let internal_rs_names: std::collections::HashSet<String> =
+        rust_crates.iter().map(|(_, cargo, _)| cargo.package.name.clone()).collect();
 
-    let internal_names: std::collections::HashSet<String> =
-        crates.iter().map(|(_, cargo, _)| cargo.package.name.clone()).collect();
-
-    let mut generated = 0;
-    for (name, cargo, crate_path) in &crates {
+    for (name, cargo, crate_path) in &rust_crates {
         let sb_path = app_dir.join(format!("{}{}", name, SB_EXT));
 
         let mut deps = Vec::new();
         for (dep_name, _) in cargo.dependencies.iter() {
-            if internal_names.contains(dep_name.as_str()) {
+            if internal_rs_names.contains(dep_name.as_str()) {
                 deps.push(dep_name.clone());
             }
         }
         for (dep_name, _) in cargo.dev_dependencies.iter() {
-            if internal_names.contains(dep_name.as_str()) && !deps.contains(dep_name) {
+            if internal_rs_names.contains(dep_name.as_str()) && !deps.contains(dep_name) {
                 deps.push(dep_name.clone());
             }
         }
 
-        // Also infer dependencies from `use` statements in source
-        match infer_use_deps(crate_path, &internal_names, name) {
+        match infer_use_deps(crate_path, &internal_rs_names, name) {
             Ok(use_deps) => {
                 for dep in use_deps {
                     if !deps.contains(&dep) {
@@ -1577,6 +1842,7 @@ fn base_workspace(app_dir: &Path) -> Result<()> {
                 name: name.clone(),
                 version: cargo.package.version.clone(),
                 description: cargo.package.description.clone(),
+                language: String::new(), // default = Rust
             },
             interface: InterfaceSpec {
                 inputs: Vec::new(),
@@ -1596,7 +1862,93 @@ fn base_workspace(app_dir: &Path) -> Result<()> {
         generated += 1;
     }
 
-    println!("\nBased {} crate(s) from {}", generated, source_dir.display());
+    // -----------------------------------------------------------------------
+    // TypeScript packages (package.json present, no Cargo.toml)
+    // -----------------------------------------------------------------------
+    let mut ts_packages: Vec<(String, PackageJson, PathBuf)> = Vec::new();
+    for entry in fs::read_dir(&source_dir)?.flatten() {
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            let pkg_json_path = entry.path().join("package.json");
+            let cargo_toml = entry.path().join("Cargo.toml");
+            if pkg_json_path.exists() && !cargo_toml.exists() {
+                let content = fs::read_to_string(&pkg_json_path)
+                    .with_context(|| format!("Failed to read {}", pkg_json_path.display()))?;
+                match serde_json::from_str::<PackageJson>(&content) {
+                    Ok(pkg) => ts_packages.push((pkg.name.clone(), pkg, entry.path())),
+                    Err(e) => {
+                        eprintln!(
+                            "  [base] Warning: failed to parse {}: {}",
+                            pkg_json_path.display(),
+                            e
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    let internal_ts_names: std::collections::HashSet<String> =
+        ts_packages.iter().map(|(name, _, _)| name.clone()).collect();
+
+    for (name, pkg, pkg_path) in &ts_packages {
+        let sb_path = app_dir.join(format!("{}{}", name, SB_EXT));
+
+        // Collect internal dependencies
+        let mut deps = Vec::new();
+        for dep_name in pkg.dependencies.keys().chain(pkg.dev_dependencies.keys()) {
+            if internal_ts_names.contains(dep_name) && dep_name != name && !deps.contains(dep_name) {
+                deps.push(dep_name.clone());
+            }
+        }
+
+        let rel_path = relative_path(app_dir, pkg_path)?;
+
+        println!("  [base] Extracting TypeScript API for '{}'...", name);
+        let api_surface = extract_ts::extract_ts_api(pkg_path).unwrap_or_else(|e| {
+            eprintln!("  [base] Warning: failed to extract TS API for {}: {}", name, e);
+            String::new()
+        });
+
+        let version = if pkg.version.is_empty() {
+            "0.0.0".to_string()
+        } else {
+            pkg.version.clone()
+        };
+
+        let spec = SpecFile {
+            package: PackageSpec {
+                name: name.clone(),
+                version,
+                description: pkg.description.clone(),
+                language: "typescript".to_string(),
+            },
+            interface: InterfaceSpec {
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                dependencies: deps,
+                api_surface,
+            },
+            source: SourceSpec { path: rel_path },
+            test: TestSpec {
+                command: format!("npm test --prefix {}", pkg_path.display()),
+            },
+            spec: SpecSection::default(),
+        };
+
+        write_spec(&sb_path, &spec)?;
+        println!("Generated {}", sb_path.display());
+        generated += 1;
+    }
+
+    if generated == 0 {
+        anyhow::bail!(
+            "No Rust crates or TypeScript packages found in {}.\n\
+            Check that each subdirectory contains either a Cargo.toml (Rust) or a package.json (TypeScript).",
+            source_dir.display()
+        );
+    }
+
+    println!("\nBased {} package(s) from {}", generated, source_dir.display());
     println!("Run `specbuild list` to see packages.");
     Ok(())
 }
@@ -1738,14 +2090,23 @@ fn backup_package(pkg_dir: &Path, app_dir: &Path) -> Result<PathBuf> {
 }
 
 fn clear_rs_files(dir: &Path) -> Result<usize> {
+    clear_source_files_by_ext(dir, RUST_SOURCE_EXTS)
+}
+
+fn clear_ts_files(dir: &Path) -> Result<usize> {
+    clear_source_files_by_ext(dir, TS_SOURCE_EXTS)
+}
+
+fn clear_source_files_by_ext(dir: &Path, exts: &[&str]) -> Result<usize> {
     let mut count = 0usize;
     for entry in walkdir::WalkDir::new(dir) {
         let entry = entry?;
-        if entry.file_type().is_file()
-            && entry.path().extension().and_then(|s| s.to_str()) == Some("rs")
-        {
-            fs::remove_file(entry.path())?;
-            count += 1;
+        if entry.file_type().is_file() {
+            let ext = entry.path().extension().and_then(|s| s.to_str()).unwrap_or("");
+            if exts.iter().any(|e| *e == ext) {
+                fs::remove_file(entry.path())?;
+                count += 1;
+            }
         }
     }
     Ok(count)
@@ -1986,10 +2347,15 @@ fn doover_package(
     println!("[doover] Backing up '{}'...", package);
     backup_package(&pkg_dir, app_dir)?;
 
-    // Clear .rs files (keep Cargo.toml, config, etc.)
+    // Clear source files (use .ts for TypeScript, .rs for Rust)
     println!("[doover] Clearing source files...");
-    let cleared = clear_rs_files(&pkg_dir)?;
-    println!("  [doover] Removed {} .rs file(s)", cleared);
+    let cleared = if is_typescript(&spec) {
+        clear_ts_files(&pkg_dir)?
+    } else {
+        clear_rs_files(&pkg_dir)?
+    };
+    let ext_label = if is_typescript(&spec) { ".ts/.tsx" } else { ".rs" };
+    println!("  [doover] Removed {} {} file(s)", cleared, ext_label);
 
     // Preserve hidden spec
     let hidden = pkg_dir.join(SPEC_HIDDEN);
@@ -2120,8 +2486,14 @@ fn main() -> Result<()> {
                 return Ok(());
             }
 
-            // Setup temp workspace once for all cargo test invocations
-            let (temp_dir, _) = setup_temp_workspace(&app_dir)?;
+            // Setup temp workspace once for all cargo test invocations.
+            // If there are no Rust packages (all TypeScript), this is skipped
+            // and each package is checked in-place.
+            let temp_dir_result = setup_temp_workspace(&app_dir);
+            let temp_dir = match temp_dir_result {
+                Ok((d, _)) => d,
+                Err(_) => app_dir.clone(), // fallback: use app_dir (TS-only projects)
+            };
 
             let mut passed = 0usize;
             let mut failed = 0usize;
@@ -2239,7 +2611,12 @@ fn main() -> Result<()> {
             let app_dir = get_app_dir(app_dir)?;
             let sb_path = app_dir.join(format!("{}{}", package, SB_EXT));
             let out_dir = out_dir.unwrap_or_else(|| app_dir.join(".specbuild-stubs"));
-            stub::generate_stub_crate(&sb_path, &out_dir)?;
+            let spec = read_spec(&sb_path)?;
+            if is_typescript(&spec) {
+                stub::generate_ts_stub_crate(&sb_path, &out_dir)?;
+            } else {
+                stub::generate_stub_crate(&sb_path, &out_dir)?;
+            }
         }
         Commands::StubAll { out_dir, app_dir } => {
             let app_dir = get_app_dir(app_dir)?;
@@ -2250,7 +2627,19 @@ fn main() -> Result<()> {
             } else {
                 for pkg in &closed {
                     let sb_path = app_dir.join(format!("{}{}", pkg, SB_EXT));
-                    stub::generate_stub_crate(&sb_path, &out_dir)?;
+                    match read_spec(&sb_path) {
+                        Ok(spec) => {
+                            if is_typescript(&spec) {
+                                stub::generate_ts_stub_crate(&sb_path, &out_dir)?;
+                            } else {
+                                stub::generate_stub_crate(&sb_path, &out_dir)?;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("  [stub] Warning: failed to read spec for '{}': {}", pkg, e);
+                            stub::generate_stub_crate(&sb_path, &out_dir)?;
+                        }
+                    }
                 }
             }
         }

@@ -33,7 +33,7 @@ pub struct Symbol {
     pub docs: String,
 }
 
-/// Build a symbol index from all crates in specbuilt-source.
+/// Build a symbol index from all packages (Rust crates or TypeScript packages) in specbuilt-source.
 pub fn build_index(source_dir: &Path) -> Result<SymbolIndex> {
     let mut index = SymbolIndex::default();
 
@@ -44,21 +44,29 @@ pub fn build_index(source_dir: &Path) -> Result<SymbolIndex> {
         if !entry.file_type()?.is_dir() {
             continue;
         }
-        let crate_dir = entry.path();
-        let crate_name = entry.file_name().to_string_lossy().to_string();
+        let pkg_dir = entry.path();
+        let pkg_name = entry.file_name().to_string_lossy().to_string();
 
-        let cargo_toml = crate_dir.join("Cargo.toml");
-        if !cargo_toml.exists() {
-            continue;
-        }
-
-        println!("  [index] Indexing '{}'...", crate_name);
-        let (symbols, usages) = index_crate(&crate_dir, &crate_name)?;
-        if !symbols.is_empty() {
-            index.crates.insert(crate_name, symbols);
-        }
-        for (sym_name, usage_list) in usages {
-            index.usages.entry(sym_name).or_default().extend(usage_list);
+        if pkg_dir.join("Cargo.toml").exists() {
+            println!("  [index] Indexing Rust crate '{}'...", pkg_name);
+            let (symbols, usages) = index_crate(&pkg_dir, &pkg_name)?;
+            if !symbols.is_empty() {
+                index.crates.insert(pkg_name, symbols);
+            }
+            for (sym_name, usage_list) in usages {
+                index.usages.entry(sym_name).or_default().extend(usage_list);
+            }
+        } else if pkg_dir.join("package.json").exists() {
+            println!("  [index] Indexing TypeScript package '{}'...", pkg_name);
+            match index_ts_package(&pkg_dir, &pkg_name) {
+                Ok(symbols) if !symbols.is_empty() => {
+                    index.crates.insert(pkg_name, symbols);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("  [index] Warning: failed to index '{}': {}", pkg_name, e);
+                }
+            }
         }
     }
 
@@ -347,6 +355,131 @@ fn extract_docs(attrs: &[syn::Attribute]) -> String {
         }
     }
     docs.join(" ")
+}
+
+// ---------------------------------------------------------------------------
+// TypeScript indexing
+// ---------------------------------------------------------------------------
+
+/// Index all `.ts` / `.tsx` files in a TypeScript package directory.
+fn index_ts_package(pkg_dir: &Path, pkg_name: &str) -> Result<Vec<Symbol>> {
+    let search_root = {
+        let src = pkg_dir.join("src");
+        if src.is_dir() { src } else { pkg_dir.to_path_buf() }
+    };
+
+    let mut symbols = Vec::new();
+
+    let files: Vec<_> = WalkDir::new(&search_root)
+        .max_depth(5)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .filter(|e| {
+            let ext = e.path().extension().and_then(|s| s.to_str());
+            matches!(ext, Some("ts") | Some("tsx"))
+        })
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy();
+            !name.ends_with(".d.ts")
+                && !name.contains(".test.")
+                && !name.contains(".spec.")
+        })
+        .collect();
+
+    for entry in files {
+        let path = entry.path();
+        let rel = path.strip_prefix(pkg_dir).unwrap_or(path);
+        let rel_str = rel.to_string_lossy().to_string();
+        match index_ts_file(path, pkg_name, &rel_str) {
+            Ok(mut syms) => symbols.append(&mut syms),
+            Err(e) => {
+                eprintln!("  [index] Warning: failed to index {}: {}", path.display(), e);
+            }
+        }
+    }
+
+    Ok(symbols)
+}
+
+fn index_ts_file(path: &Path, pkg_name: &str, rel_path: &str) -> Result<Vec<Symbol>> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+
+    let mut symbols = Vec::new();
+
+    for (line_idx, line) in content.lines().enumerate() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("export") {
+            continue;
+        }
+
+        let rest = trimmed["export".len()..].trim_start();
+        // Skip type-only re-exports and `export {}`
+        if rest.starts_with("type {") || rest.starts_with('{') || rest.starts_with('*') {
+            continue;
+        }
+
+        let (kind, name) = extract_ts_symbol_info(rest);
+        if name.is_empty() {
+            continue;
+        }
+
+        symbols.push(Symbol {
+            name: format!("{}::{}", pkg_name, name),
+            kind: kind.to_string(),
+            file: rel_path.to_string(),
+            line: line_idx + 1,
+            docs: String::new(),
+        });
+    }
+
+    Ok(symbols)
+}
+
+/// Determine the kind and name of a TypeScript export from the text after `export`.
+fn extract_ts_symbol_info(rest: &str) -> (&'static str, String) {
+    // Strip optional modifiers
+    let rest = strip_ts_modifiers(rest);
+
+    for (prefix, kind) in &[
+        ("interface ", "interface"),
+        ("class ", "class"),
+        ("abstract class ", "class"),
+        ("function ", "function"),
+        ("async function ", "function"),
+        ("enum ", "enum"),
+        ("const enum ", "enum"),
+        ("type ", "type"),
+        ("const ", "const"),
+        ("let ", "let"),
+        ("var ", "var"),
+    ] {
+        if let Some(after) = rest.strip_prefix(prefix) {
+            let name = after
+                .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '$')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            return (kind, name);
+        }
+    }
+
+    ("unknown", String::new())
+}
+
+fn strip_ts_modifiers(s: &str) -> &str {
+    let mut rest = s.trim();
+    loop {
+        if let Some(r) = rest.strip_prefix("declare ") {
+            rest = r.trim_start();
+        } else if let Some(r) = rest.strip_prefix("default ") {
+            rest = r.trim_start();
+        } else {
+            break;
+        }
+    }
+    rest
 }
 
 pub fn get_index_path(app_dir: &Path) -> Result<PathBuf> {

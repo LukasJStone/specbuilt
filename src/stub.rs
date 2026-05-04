@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::Path;
+use crate::extract_ts;
 
 /// Generate a compilable stub module file from a .sb spec file.
 /// Writes a single `.rs` file (not a full crate with Cargo.toml).
@@ -166,4 +167,88 @@ fn transform_impl_block(text: &str) -> String {
     }
 
     result
+}
+
+// ---------------------------------------------------------------------------
+// TypeScript stubs
+// ---------------------------------------------------------------------------
+
+/// Generate stub TypeScript source from an api_surface string.
+fn ts_stub_source(spec: &crate::SpecFile) -> String {
+    if spec.interface.api_surface.is_empty() {
+        "// Empty stub — no public API surface extracted\nexport {};\n".to_string()
+    } else {
+        extract_ts::make_ts_compilable(&spec.interface.api_surface)
+    }
+}
+
+/// Generate a compilable TypeScript stub module file from a .sb spec.
+/// Writes a single `.ts` file.
+pub fn generate_ts_module_stub(spec_path: &Path, output_path: &Path) -> Result<()> {
+    let content = fs::read_to_string(spec_path)
+        .with_context(|| format!("Failed to read spec: {}", spec_path.display()))?;
+    let spec: crate::SpecFile = toml::from_str(&content)
+        .with_context(|| format!("Failed to parse spec: {}", spec_path.display()))?;
+
+    let stub_src = ts_stub_source(&spec);
+
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    fs::write(output_path, stub_src)
+        .with_context(|| format!("Failed to write TS stub: {}", output_path.display()))?;
+
+    println!(
+        "Generated TypeScript module stub for '{}' -> {}",
+        spec.package.name,
+        output_path.display()
+    );
+    Ok(())
+}
+
+/// Generate a compilable TypeScript stub package from a .sb spec.
+/// Writes `output_dir/<name>/index.ts` and `output_dir/<name>/package.json`.
+pub fn generate_ts_stub_crate(spec_path: &Path, output_dir: &Path) -> Result<()> {
+    let content = fs::read_to_string(spec_path)
+        .with_context(|| format!("Failed to read spec: {}", spec_path.display()))?;
+    let spec: crate::SpecFile = toml::from_str(&content)
+        .with_context(|| format!("Failed to parse spec: {}", spec_path.display()))?;
+
+    let stub_src = ts_stub_source(&spec);
+
+    let pkg_dir = output_dir.join(&spec.package.name);
+    fs::create_dir_all(&pkg_dir)?;
+
+    fs::write(pkg_dir.join("index.ts"), stub_src)
+        .with_context(|| format!("Failed to write index.ts in {}", pkg_dir.display()))?;
+
+    let version = if spec.package.version.is_empty() {
+        "0.0.0".to_string()
+    } else {
+        spec.package.version.clone()
+    };
+
+    let pkg_json = format!(
+        r#"{{
+  "name": "{}",
+  "version": "{}",
+  "description": "{}",
+  "main": "index.ts",
+  "types": "index.ts"
+}}
+"#,
+        spec.package.name,
+        version,
+        spec.package.description
+    );
+    fs::write(pkg_dir.join("package.json"), pkg_json)
+        .with_context(|| format!("Failed to write package.json in {}", pkg_dir.display()))?;
+
+    println!(
+        "Generated TypeScript stub for '{}' -> {}",
+        spec.package.name,
+        pkg_dir.display()
+    );
+    Ok(())
 }
