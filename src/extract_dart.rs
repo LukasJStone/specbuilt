@@ -161,12 +161,13 @@ fn parse_dart_exports(content: &str) -> Vec<DartItem> {
                     '{' => brace_depth += 1,
                     '}' => {
                         brace_depth -= 1;
-                        if brace_depth < 0 {
-                            brace_depth = 0;
-                        }
                     }
                     _ => {}
                 }
+            }
+            if brace_depth < 0 {
+                eprintln!("  [extract_dart] Warning: unbalanced braces encountered; resetting depth");
+                brace_depth = 0;
             }
             i += 1;
             continue;
@@ -294,7 +295,10 @@ fn parse_dart_exports(content: &str) -> Vec<DartItem> {
                 let opens: i32 = line.chars().filter(|&c| c == '{').count() as i32;
                 let closes: i32 = line.chars().filter(|&c| c == '}').count() as i32;
                 brace_depth += opens - closes;
-                if brace_depth < 0 { brace_depth = 0; }
+                if brace_depth < 0 {
+                    eprintln!("  [extract_dart] Warning: unbalanced braces encountered; resetting depth");
+                    brace_depth = 0;
+                }
                 i += 1;
             }
             continue;
@@ -304,7 +308,10 @@ fn parse_dart_exports(content: &str) -> Vec<DartItem> {
         let opens: i32 = line.chars().filter(|&c| c == '{').count() as i32;
         let closes: i32 = line.chars().filter(|&c| c == '}').count() as i32;
         brace_depth += opens - closes;
-        if brace_depth < 0 { brace_depth = 0; }
+        if brace_depth < 0 {
+            eprintln!("  [extract_dart] Warning: unbalanced braces encountered; resetting depth");
+            brace_depth = 0;
+        }
         i += 1;
     }
 
