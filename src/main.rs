@@ -9,6 +9,7 @@ use std::time::SystemTime;
 
 mod agent;
 mod extract;
+mod extract_dart;
 mod extract_ts;
 mod index;
 mod stub;
@@ -217,7 +218,7 @@ struct PackageSpec {
     version: String,
     #[serde(default)]
     description: String,
-    /// "rust" (default) or "typescript" / "ts"
+    /// "rust" (default), "typescript" / "ts", or "flutter" / "dart"
     #[serde(default)]
     language: String,
 }
@@ -291,6 +292,73 @@ struct PackageJson {
     dev_dependencies: serde_json::Map<String, serde_json::Value>,
 }
 
+/// Minimal pubspec.yaml representation for base command (Flutter/Dart packages).
+/// Parsed manually (no serde_yaml dependency).
+#[derive(Debug, Default)]
+struct PubspecYaml {
+    name: String,
+    version: String,
+    description: String,
+    dependencies: Vec<String>,
+    dev_dependencies: Vec<String>,
+}
+
+impl PubspecYaml {
+    fn parse(content: &str) -> Self {
+        let mut result = PubspecYaml::default();
+        let mut section = "";
+
+        for line in content.lines() {
+            // Top-level scalar fields
+            if let Some(v) = line.strip_prefix("name:") {
+                result.name = v.trim().trim_matches('"').trim_matches('\'').to_string();
+                continue;
+            }
+            if let Some(v) = line.strip_prefix("version:") {
+                result.version = v.trim().trim_matches('"').trim_matches('\'').to_string();
+                continue;
+            }
+            if let Some(v) = line.strip_prefix("description:") {
+                result.description = v.trim().trim_matches('"').trim_matches('\'').to_string();
+                continue;
+            }
+
+            // Section headers
+            if line == "dependencies:" || line.starts_with("dependencies:") {
+                section = "deps";
+                continue;
+            }
+            if line == "dev_dependencies:" || line.starts_with("dev_dependencies:") {
+                section = "dev_deps";
+                continue;
+            }
+            // Any other non-indented, non-empty line ends the current section
+            if !line.is_empty() && !line.starts_with(' ') && !line.starts_with('\t') {
+                section = "";
+            }
+
+            // Dependency entries (indented lines like "  flutter:" or "  some_pkg: ^1.0.0")
+            if (section == "deps" || section == "dev_deps")
+                && (line.starts_with("  ") || line.starts_with('\t'))
+            {
+                let trimmed = line.trim();
+                if let Some(dep_name) = trimmed.split(':').next() {
+                    let dep_name = dep_name.trim().to_string();
+                    if !dep_name.is_empty() && !dep_name.starts_with('#') {
+                        if section == "deps" {
+                            result.dependencies.push(dep_name);
+                        } else {
+                            result.dev_dependencies.push(dep_name);
+                        }
+                    }
+                }
+            }
+        }
+
+        result
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Check database types
 // ---------------------------------------------------------------------------
@@ -346,13 +414,22 @@ const SB_EXT: &str = ".sb";
 const SPEC_HIDDEN: &str = ".specbuilt.sb";
 const RUST_SOURCE_EXTS: &[&str] = &["rs"];
 const TS_SOURCE_EXTS: &[&str] = &["ts", "tsx"];
-const ALL_SOURCE_EXTS: &[&str] = &["rs", "ts", "tsx"];
+const DART_SOURCE_EXTS: &[&str] = &["dart"];
+const ALL_SOURCE_EXTS: &[&str] = &["rs", "ts", "tsx", "dart"];
 
 /// Returns true if the spec declares this package as a TypeScript package.
 fn is_typescript(spec: &SpecFile) -> bool {
     matches!(
         spec.package.language.to_ascii_lowercase().as_str(),
         "typescript" | "ts"
+    )
+}
+
+/// Returns true if the spec declares this package as a Flutter/Dart package.
+fn is_flutter(spec: &SpecFile) -> bool {
+    matches!(
+        spec.package.language.to_ascii_lowercase().as_str(),
+        "flutter" | "dart"
     )
 }
 
@@ -829,15 +906,15 @@ fn setup_temp_workspace(app_dir: &Path) -> Result<(PathBuf, Vec<String>)> {
         if name_str.ends_with(SB_EXT) {
             let pkg_name = name_str[..name_str.len() - SB_EXT.len()].to_string();
             let spec = read_spec(&entry.path())?;
-            // Skip TypeScript packages — they don't belong in a Cargo workspace
-            if !is_typescript(&spec) {
+            // Skip TypeScript and Flutter packages — they don't belong in a Cargo workspace
+            if !is_typescript(&spec) && !is_flutter(&spec) {
                 packages.push((pkg_name, spec, false));
             }
         } else if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             let hidden = entry.path().join(SPEC_HIDDEN);
             if hidden.exists() {
                 let spec = read_spec(&hidden)?;
-                if !is_typescript(&spec) {
+                if !is_typescript(&spec) && !is_flutter(&spec) {
                     packages.push((name_str.to_string(), spec, true));
                 }
             }
@@ -896,6 +973,11 @@ fn run_checks(
     // TypeScript packages do not use cargo — route to the TS check path
     if is_typescript(spec) {
         return run_ts_checks(package, _source_path, spec);
+    }
+
+    // Flutter/Dart packages do not use cargo — route to the Flutter check path
+    if is_flutter(spec) {
+        return run_flutter_checks(package, _source_path, spec);
     }
 
     // 1. Spec validity check
@@ -1042,6 +1124,104 @@ fn run_ts_checks(
             }
             return Ok((CheckResult::Failed, reason));
         }
+    }
+
+    // 3. Run spec verify_command if present
+    if let Some(cmd_str) = &spec.spec.verify_command {
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(cmd_str)
+            .current_dir(source_path)
+            .output()
+            .with_context(|| format!("Failed to run verify_command: {}", cmd_str))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let reason = if !stderr.is_empty() {
+                format!("verify_command failed: {}", stderr.trim())
+            } else {
+                format!("verify_command failed: {}", stdout.trim())
+            };
+            return Ok((CheckResult::Failed, reason));
+        }
+    }
+
+    // 4. External AI checker
+    if let Ok(ai_checker) = std::env::var("SPECBUILD_AI_CHECKER") {
+        let output = std::process::Command::new(&ai_checker)
+            .arg(package)
+            .current_dir(source_path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .with_context(|| format!("Failed to run AI checker: {}", ai_checker))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if let Ok(ai_result) = serde_json::from_str::<AiCheckResult>(&stdout) {
+            return Ok((ai_result.result, ai_result.reason));
+        }
+        if output.status.success() {
+            return Ok((CheckResult::Passed, format!("AI check passed: {}", stdout.trim())));
+        } else {
+            return Ok((CheckResult::Failed, format!("AI check failed: {}", stdout.trim())));
+        }
+    }
+
+    Ok((CheckResult::Passed, "All checks passed".to_string()))
+}
+
+/// Check a Flutter/Dart package: run `[test].command` and `[spec].verify_command`
+/// directly in the source directory (no cargo workspace required).
+fn run_flutter_checks(
+    package: &str,
+    source_path: &Path,
+    spec: &SpecFile,
+) -> Result<(CheckResult, String)> {
+    // 1. Spec validity check
+    if spec.spec.invariants.is_empty() && spec.spec.verify_command.is_none() {
+        return Ok((
+            CheckResult::Bugged,
+            "No invariants or verify_command defined in spec".to_string(),
+        ));
+    }
+
+    for inv in &spec.spec.invariants {
+        if inv.trim().is_empty() {
+            return Ok((
+                CheckResult::Bugged,
+                "Empty invariant found in spec".to_string(),
+            ));
+        }
+    }
+
+    // 2. Run the test command from [test].command if provided, otherwise default to `flutter test`
+    let test_cmd = if !spec.test.command.is_empty() {
+        spec.test.command.clone()
+    } else {
+        "flutter test".to_string()
+    };
+
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&test_cmd)
+        .current_dir(source_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .with_context(|| format!("Failed to run test command: {}", test_cmd))?;
+
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let mut reason = format!("Tests failed for '{}'\n", package);
+        if !stdout.is_empty() {
+            reason.push_str(&format!("\nSTDOUT:\n{}", stdout));
+        }
+        if !stderr.is_empty() {
+            reason.push_str(&format!("\nSTDERR:\n{}", stderr));
+        }
+        return Ok((CheckResult::Failed, reason));
     }
 
     // 3. Run spec verify_command if present
@@ -1242,6 +1422,8 @@ fn close_package(package: &str, app_dir: &Path, regenerate: bool) -> Result<()> 
         println!("  [close] Regenerating spec from source...");
         let api_result = if is_typescript(&spec) {
             extract_ts::extract_ts_api(&source_path)
+        } else if is_flutter(&spec) {
+            extract_dart::extract_dart_api(&source_path)
         } else {
             extract::extract_crate_api(&source_path)
         };
@@ -1379,6 +1561,11 @@ fn close_module(path: &str, app_dir: &Path, _regenerate: bool) -> Result<()> {
             ModuleLocation::File(mod_path) => extract_ts::extract_ts_module_api(mod_path)?,
             ModuleLocation::Directory(mod_path) => extract_ts::extract_ts_module_api(mod_path)?,
         }
+    } else if is_flutter(&crate_spec) {
+        match &location {
+            ModuleLocation::File(mod_path) => extract_dart::extract_dart_module_api(mod_path)?,
+            ModuleLocation::Directory(mod_path) => extract_dart::extract_dart_module_api(mod_path)?,
+        }
     } else {
         match &location {
             ModuleLocation::File(mod_path) => extract::extract_module_api(mod_path)?,
@@ -1444,6 +1631,18 @@ fn close_module(path: &str, app_dir: &Path, _regenerate: bool) -> Result<()> {
                 let stub_path = mod_dir.with_extension("ts");
                 remove_dir_all_if_exists(mod_dir)?;
                 stub::generate_ts_module_stub(&sb_path, &stub_path)?;
+            }
+        }
+    } else if is_flutter(&spec) {
+        match &location {
+            ModuleLocation::File(mod_path) => {
+                stub::generate_flutter_module_stub(&sb_path, mod_path)?;
+            }
+            ModuleLocation::Directory(mod_path) => {
+                let mod_dir = mod_path.parent().unwrap();
+                let stub_path = mod_dir.with_extension("dart");
+                remove_dir_all_if_exists(mod_dir)?;
+                stub::generate_flutter_module_stub(&sb_path, &stub_path)?;
             }
         }
     } else {
@@ -1619,8 +1818,9 @@ fn list_packages(app_dir: &Path) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn build_project(app_dir: &Path) -> Result<()> {
-    // Separate Rust and TypeScript packages
+    // Separate TypeScript and Flutter packages
     let mut ts_packages: Vec<(String, PathBuf)> = Vec::new();
+    let mut flutter_packages: Vec<(String, PathBuf)> = Vec::new();
 
     for entry in fs::read_dir(app_dir)?.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
@@ -1630,6 +1830,9 @@ fn build_project(app_dir: &Path) -> Result<()> {
                 if is_typescript(&spec) {
                     let src = app_dir.join(&spec.source.path);
                     ts_packages.push((pkg_name, src));
+                } else if is_flutter(&spec) {
+                    let src = app_dir.join(&spec.source.path);
+                    flutter_packages.push((pkg_name, src));
                 }
             }
         } else if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
@@ -1638,6 +1841,8 @@ fn build_project(app_dir: &Path) -> Result<()> {
                 if let Ok(spec) = read_spec(&hidden) {
                     if is_typescript(&spec) {
                         ts_packages.push((name, entry.path()));
+                    } else if is_flutter(&spec) {
+                        flutter_packages.push((name, entry.path()));
                     }
                 }
             }
@@ -1666,8 +1871,8 @@ fn build_project(app_dir: &Path) -> Result<()> {
             println!("Rust build succeeded.");
         }
         Err(e) => {
-            // No Rust packages — not an error if there are TS packages
-            if ts_packages.is_empty() {
+            // No Rust packages — not an error if there are TS/Flutter packages
+            if ts_packages.is_empty() && flutter_packages.is_empty() {
                 return Err(e);
             }
             println!("  [build] No Rust packages to build.");
@@ -1721,6 +1926,59 @@ fn build_project(app_dir: &Path) -> Result<()> {
         }
     }
 
+    // Build Flutter/Dart packages
+    for (name, src_path) in &flutter_packages {
+        println!("Building Flutter package '{}'...", name);
+        if !src_path.exists() {
+            eprintln!("  [build] Warning: source path does not exist for '{}'", name);
+            continue;
+        }
+        // Run `flutter pub get` to fetch dependencies
+        println!("  [build] Running flutter pub get for '{}'...", name);
+        let status = std::process::Command::new("flutter")
+            .arg("pub")
+            .arg("get")
+            .current_dir(src_path)
+            .status()
+            .with_context(|| format!("Failed to run flutter pub get for '{}'. Is Flutter installed?", name))?;
+        if !status.success() {
+            eprintln!("  [build] flutter pub get failed for '{}', continuing...", name);
+            continue;
+        }
+        // Run `flutter build` — only makes sense for app packages, not pure libraries.
+        // We use `dart pub publish --dry-run` for library packages instead.
+        // Detect via presence of `flutter` -> `sdk: flutter` in pubspec.yaml.
+        let pubspec_path = src_path.join("pubspec.yaml");
+        let is_app = fs::read_to_string(&pubspec_path)
+            .ok()
+            .map(|c| c.contains("sdk: flutter"))
+            .unwrap_or(false);
+
+        if is_app {
+            // For Flutter apps, just ensure it compiles (analyze)
+            let status = std::process::Command::new("flutter")
+                .arg("analyze")
+                .current_dir(src_path)
+                .status()
+                .with_context(|| format!("Failed to run flutter analyze for '{}'", name))?;
+            if !status.success() {
+                anyhow::bail!("flutter analyze failed for '{}'", name);
+            }
+            println!("  Flutter analyze succeeded for '{}'.", name);
+        } else {
+            // Pure Dart package — run `dart analyze`
+            let status = std::process::Command::new("dart")
+                .arg("analyze")
+                .current_dir(src_path)
+                .status()
+                .with_context(|| format!("Failed to run dart analyze for '{}'", name))?;
+            if !status.success() {
+                anyhow::bail!("dart analyze failed for '{}'", name);
+            }
+            println!("  Dart analyze succeeded for '{}'.", name);
+        }
+    }
+
     Ok(())
 }
 
@@ -1738,9 +1996,14 @@ pub fn discover_sb_dir(app_dir: &Path) -> Result<PathBuf> {
         b
     } else if let Some(b) = app_name.strip_suffix("-ts") {
         b
+    } else if let Some(b) = app_name.strip_suffix("-dart") {
+        b
+    } else if let Some(b) = app_name.strip_suffix("-flutter") {
+        b
     } else {
         anyhow::bail!(
-            "Expected current directory to end with '-rs' or '-ts' (e.g. 'application-rs' or 'application-ts'), got: {}",
+            "Expected current directory to end with '-rs', '-ts', '-dart', or '-flutter' \
+             (e.g. 'application-rs', 'application-ts', 'application-dart'), got: {}",
             app_name
         );
     };
@@ -1940,10 +2203,87 @@ fn base_workspace(app_dir: &Path) -> Result<()> {
         generated += 1;
     }
 
+    // -----------------------------------------------------------------------
+    // Flutter/Dart packages (pubspec.yaml present, no Cargo.toml, no package.json)
+    // -----------------------------------------------------------------------
+    let mut flutter_packages: Vec<(String, PubspecYaml, PathBuf)> = Vec::new();
+    for entry in fs::read_dir(&source_dir)?.flatten() {
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            let pubspec_path = entry.path().join("pubspec.yaml");
+            let cargo_toml = entry.path().join("Cargo.toml");
+            let pkg_json = entry.path().join("package.json");
+            if pubspec_path.exists() && !cargo_toml.exists() && !pkg_json.exists() {
+                let content = fs::read_to_string(&pubspec_path)
+                    .with_context(|| format!("Failed to read {}", pubspec_path.display()))?;
+                let pubspec = PubspecYaml::parse(&content);
+                let name = if pubspec.name.is_empty() {
+                    entry.file_name().to_string_lossy().to_string()
+                } else {
+                    pubspec.name.clone()
+                };
+                flutter_packages.push((name, pubspec, entry.path()));
+            }
+        }
+    }
+
+    let internal_flutter_names: std::collections::HashSet<String> =
+        flutter_packages.iter().map(|(name, _, _)| name.clone()).collect();
+
+    for (name, pubspec, pkg_path) in &flutter_packages {
+        let sb_path = app_dir.join(format!("{}{}", name, SB_EXT));
+
+        // Collect internal dependencies (from pubspec dependencies section)
+        let mut deps = Vec::new();
+        for dep_name in pubspec.dependencies.iter().chain(pubspec.dev_dependencies.iter()) {
+            if internal_flutter_names.contains(dep_name) && dep_name != name && !deps.contains(dep_name) {
+                deps.push(dep_name.clone());
+            }
+        }
+
+        let rel_path = relative_path(app_dir, pkg_path)?;
+
+        println!("  [base] Extracting Dart API for '{}'...", name);
+        let api_surface = extract_dart::extract_dart_api(pkg_path).unwrap_or_else(|e| {
+            eprintln!("  [base] Warning: failed to extract Dart API for {}: {}", name, e);
+            String::new()
+        });
+
+        let version = if pubspec.version.is_empty() {
+            "0.0.1".to_string()
+        } else {
+            pubspec.version.clone()
+        };
+
+        let spec = SpecFile {
+            package: PackageSpec {
+                name: name.clone(),
+                version,
+                description: pubspec.description.clone(),
+                language: "flutter".to_string(),
+            },
+            interface: InterfaceSpec {
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                dependencies: deps,
+                api_surface,
+            },
+            source: SourceSpec { path: rel_path },
+            test: TestSpec {
+                command: "flutter test".to_string(),
+            },
+            spec: SpecSection::default(),
+        };
+
+        write_spec(&sb_path, &spec)?;
+        println!("Generated {}", sb_path.display());
+        generated += 1;
+    }
+
     if generated == 0 {
         anyhow::bail!(
-            "No Rust crates or TypeScript packages found in {}.\n\
-            Check that each subdirectory contains either a Cargo.toml (Rust) or a package.json (TypeScript).",
+            "No Rust crates, TypeScript packages, or Flutter/Dart packages found in {}.\n\
+            Check that each subdirectory contains a Cargo.toml (Rust), package.json (TypeScript), \
+            or pubspec.yaml (Flutter/Dart).",
             source_dir.display()
         );
     }
@@ -2095,6 +2435,10 @@ fn clear_rs_files(dir: &Path) -> Result<usize> {
 
 fn clear_ts_files(dir: &Path) -> Result<usize> {
     clear_source_files_by_ext(dir, TS_SOURCE_EXTS)
+}
+
+fn clear_dart_files(dir: &Path) -> Result<usize> {
+    clear_source_files_by_ext(dir, DART_SOURCE_EXTS)
 }
 
 fn clear_source_files_by_ext(dir: &Path, exts: &[&str]) -> Result<usize> {
@@ -2347,14 +2691,22 @@ fn doover_package(
     println!("[doover] Backing up '{}'...", package);
     backup_package(&pkg_dir, app_dir)?;
 
-    // Clear source files (use .ts for TypeScript, .rs for Rust)
+    // Clear source files (use .ts for TypeScript, .dart for Flutter, .rs for Rust)
     println!("[doover] Clearing source files...");
     let cleared = if is_typescript(&spec) {
         clear_ts_files(&pkg_dir)?
+    } else if is_flutter(&spec) {
+        clear_dart_files(&pkg_dir)?
     } else {
         clear_rs_files(&pkg_dir)?
     };
-    let ext_label = if is_typescript(&spec) { ".ts/.tsx" } else { ".rs" };
+    let ext_label = if is_typescript(&spec) {
+        ".ts/.tsx"
+    } else if is_flutter(&spec) {
+        ".dart"
+    } else {
+        ".rs"
+    };
     println!("  [doover] Removed {} {} file(s)", cleared, ext_label);
 
     // Preserve hidden spec
@@ -2614,6 +2966,8 @@ fn main() -> Result<()> {
             let spec = read_spec(&sb_path)?;
             if is_typescript(&spec) {
                 stub::generate_ts_stub_crate(&sb_path, &out_dir)?;
+            } else if is_flutter(&spec) {
+                stub::generate_flutter_stub_crate(&sb_path, &out_dir)?;
             } else {
                 stub::generate_stub_crate(&sb_path, &out_dir)?;
             }
@@ -2631,6 +2985,8 @@ fn main() -> Result<()> {
                         Ok(spec) => {
                             if is_typescript(&spec) {
                                 stub::generate_ts_stub_crate(&sb_path, &out_dir)?;
+                            } else if is_flutter(&spec) {
+                                stub::generate_flutter_stub_crate(&sb_path, &out_dir)?;
                             } else {
                                 stub::generate_stub_crate(&sb_path, &out_dir)?;
                             }
