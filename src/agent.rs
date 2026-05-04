@@ -580,13 +580,15 @@ impl Tool for RunShellTool {
 
 fn build_preamble(action: &str, package: &str) -> String {
     format!(
-        r#"You are an expert Rust engineer working within the Specbuilt context-window management system.
+        r#"You are an expert software engineer working within the Specbuilt context-window management system.
 
 You are currently performing a `{action}` operation on package `{package}`.
 
 The codebase is organized into packages. Each package is either:
 - CLOSED: represented by a `.sb` spec file (a lightweight contract with interface, dependencies, and behavioral spec)
 - OPEN: full source code is available for editing
+
+Packages may be written in Rust or TypeScript (indicated by `[package].language` in the .sb spec).
 
 Your task is to modify the opened package according to the user's instructions.
 
@@ -596,18 +598,19 @@ Available tools:
 - list_directory: List files in a directory
 - list_packages: List all packages and their open/closed status
 - read_spec: Read the .sb spec for a package
-- run_shell_command: Run a shell command (for cargo test, cargo check, grep, etc.)
+- run_shell_command: Run a shell command (for cargo test, cargo check, npm test, tsc, grep, etc.)
 
 Workflow:
-1. Read the package spec to understand the contract
+1. Read the package spec to understand the contract and language
 2. Explore existing source files
 3. Make the necessary changes
-4. Run cargo test or cargo check to verify your changes
+4. For Rust: run `cargo test` or `cargo check` to verify
+   For TypeScript: run `npm test`, `tsc --noEmit`, or the command in `[test].command`
 5. Iterate until everything passes
 
 Rules:
 - Only modify files within the opened package unless explicitly asked
-- Follow Rust best practices and idioms
+- Follow the idiomatic style of the package language (Rust or TypeScript)
 - Maintain compatibility with the package's public API as described in the spec
 - Do not break existing tests unless the spec explicitly requires a behavior change"#
     )
