@@ -2230,53 +2230,112 @@ fn base_workspace(app_dir: &Path) -> Result<()> {
         flutter_packages.iter().map(|(name, _, _)| name.clone()).collect();
 
     for (name, pubspec, pkg_path) in &flutter_packages {
-        let sb_path = app_dir.join(format!("{}{}", name, SB_EXT));
+        let features_dir = pkg_path.join("lib").join("features");
 
-        // Collect internal dependencies (from pubspec dependencies section)
-        let mut deps = Vec::new();
-        for dep_name in pubspec.dependencies.iter().chain(pubspec.dev_dependencies.iter()) {
-            if internal_flutter_names.contains(dep_name) && dep_name != name && !deps.contains(dep_name) {
-                deps.push(dep_name.clone());
+        if features_dir.exists() && features_dir.is_dir() {
+            // Monolithic Flutter app with lib/features/ — generate per-feature .sb files
+            for entry in fs::read_dir(&features_dir)?.flatten() {
+                if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                let module_name = entry.file_name().to_string_lossy().to_string();
+                let module_path = entry.path();
+
+                // Skip directories with no .dart files
+                let has_dart = walkdir::WalkDir::new(&module_path)
+                    .max_depth(3)
+                    .into_iter()
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.file_type().is_file())
+                    .any(|e| e.path().extension().and_then(|s| s.to_str()) == Some("dart"));
+
+                if !has_dart {
+                    println!("  [base] Skipping feature '{}' — no .dart files", module_name);
+                    continue;
+                }
+
+                let sb_path = app_dir.join(format!("{}{}", module_name, SB_EXT));
+                let rel_path = relative_path(app_dir, &module_path)?;
+
+                println!("  [base] Extracting Dart API for feature '{}'...", module_name);
+                let api_surface = extract_dart::extract_dart_api(&module_path).unwrap_or_else(|e| {
+                    eprintln!("  [base] Warning: failed to extract Dart API for {}: {}", module_name, e);
+                    String::new()
+                });
+
+                let spec = SpecFile {
+                    package: PackageSpec {
+                        name: module_name.clone(),
+                        version: if pubspec.version.is_empty() { "0.0.1".to_string() } else { pubspec.version.clone() },
+                        description: format!("Flutter feature module: {}", module_name),
+                        language: "flutter".to_string(),
+                    },
+                    interface: InterfaceSpec {
+                        inputs: Vec::new(),
+                        outputs: Vec::new(),
+                        dependencies: Vec::new(), // TODO: infer from import statements
+                        api_surface,
+                    },
+                    source: SourceSpec { path: rel_path },
+                    test: TestSpec {
+                        command: format!("cd {} && flutter test", pkg_path.display()),
+                    },
+                    spec: SpecSection::default(),
+                };
+
+                write_spec(&sb_path, &spec)?;
+                println!("Generated {}", sb_path.display());
+                generated += 1;
             }
-        }
-
-        let rel_path = relative_path(app_dir, pkg_path)?;
-
-        println!("  [base] Extracting Dart API for '{}'...", name);
-        let api_surface = extract_dart::extract_dart_api(pkg_path).unwrap_or_else(|e| {
-            eprintln!("  [base] Warning: failed to extract Dart API for {}: {}", name, e);
-            String::new()
-        });
-
-        let version = if pubspec.version.is_empty() {
-            "0.0.1".to_string()
         } else {
-            pubspec.version.clone()
-        };
+            // Standalone Flutter package — generate single .sb
+            let sb_path = app_dir.join(format!("{}{}", name, SB_EXT));
 
-        let spec = SpecFile {
-            package: PackageSpec {
-                name: name.clone(),
-                version,
-                description: pubspec.description.clone(),
-                language: "flutter".to_string(),
-            },
-            interface: InterfaceSpec {
-                inputs: Vec::new(),
-                outputs: Vec::new(),
-                dependencies: deps,
-                api_surface,
-            },
-            source: SourceSpec { path: rel_path },
-            test: TestSpec {
-                command: "flutter test".to_string(),
-            },
-            spec: SpecSection::default(),
-        };
+            let mut deps = Vec::new();
+            for dep_name in pubspec.dependencies.iter().chain(pubspec.dev_dependencies.iter()) {
+                if internal_flutter_names.contains(dep_name) && dep_name != name && !deps.contains(dep_name) {
+                    deps.push(dep_name.clone());
+                }
+            }
 
-        write_spec(&sb_path, &spec)?;
-        println!("Generated {}", sb_path.display());
-        generated += 1;
+            let rel_path = relative_path(app_dir, pkg_path)?;
+
+            println!("  [base] Extracting Dart API for '{}'...", name);
+            let api_surface = extract_dart::extract_dart_api(pkg_path).unwrap_or_else(|e| {
+                eprintln!("  [base] Warning: failed to extract Dart API for {}: {}", name, e);
+                String::new()
+            });
+
+            let version = if pubspec.version.is_empty() {
+                "0.0.1".to_string()
+            } else {
+                pubspec.version.clone()
+            };
+
+            let spec = SpecFile {
+                package: PackageSpec {
+                    name: name.clone(),
+                    version,
+                    description: pubspec.description.clone(),
+                    language: "flutter".to_string(),
+                },
+                interface: InterfaceSpec {
+                    inputs: Vec::new(),
+                    outputs: Vec::new(),
+                    dependencies: deps,
+                    api_surface,
+                },
+                source: SourceSpec { path: rel_path },
+                test: TestSpec {
+                    command: "flutter test".to_string(),
+                },
+                spec: SpecSection::default(),
+            };
+
+            write_spec(&sb_path, &spec)?;
+            println!("Generated {}", sb_path.display());
+            generated += 1;
+        }
     }
 
     if generated == 0 {

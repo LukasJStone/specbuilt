@@ -591,9 +591,13 @@ pub fn make_dart_stub(api_surface: &str) -> String {
 
         // Class / mixin / extension / enum header ending with `{`
         if line.trim_end().ends_with('{') {
-            result.push_str(line);
-            result.push('\n');
-            result.push_str("}\n");
+            if is_flutter_widget_class(line) {
+                result.push_str(&generate_widget_stub(line));
+            } else {
+                result.push_str(line);
+                result.push('\n');
+                result.push_str("}\n");
+            }
             i += 1;
             continue;
         }
@@ -614,4 +618,92 @@ pub fn make_dart_stub(api_surface: &str) -> String {
     }
 
     result
+}
+
+// ---------------------------------------------------------------------------
+// Flutter widget stub helpers
+// ---------------------------------------------------------------------------
+
+fn is_flutter_widget_class(line: &str) -> bool {
+    let l = line.to_lowercase();
+    l.contains("extends statelesswidget")
+        || l.contains("extends statefulwidget")
+        || l.contains("extends consumerwidget")
+        || l.contains("extends consumerstatefulwidget")
+        || l.contains("extends hookwidget")
+        || l.contains("extends hookconsumerwidget")
+}
+
+fn generate_widget_stub(class_decl: &str) -> String {
+    let class_name = extract_class_name_from_decl(class_decl).unwrap_or_else(|| "Widget".to_string());
+    let is_stateful = class_decl.to_lowercase().contains("statefulwidget");
+    let is_consumer = class_decl.to_lowercase().contains("consumer");
+
+    let mut stub = String::new();
+    stub.push_str(class_decl);
+    stub.push('\n');
+
+    // Generic const constructor — accepts super.key so call sites using const Widget(key: ...) compile
+    stub.push_str("  const ");
+    stub.push_str(&class_name);
+    stub.push_str("({super.key});\n");
+
+    if is_stateful {
+        stub.push_str("  @override\n");
+        if is_consumer {
+            stub.push_str("  ConsumerState<");
+            stub.push_str(&class_name);
+            stub.push_str("> createState() => _");
+            stub.push_str(&class_name);
+            stub.push_str("State();\n");
+        } else {
+            stub.push_str("  State<");
+            stub.push_str(&class_name);
+            stub.push_str("> createState() => _");
+            stub.push_str(&class_name);
+            stub.push_str("State();\n");
+        }
+    } else {
+        stub.push_str("  @override\n");
+        stub.push_str("  Widget build(BuildContext context");
+        if is_consumer {
+            stub.push_str(", WidgetRef ref");
+        }
+        stub.push_str(") => const SizedBox.shrink();\n");
+    }
+
+    stub.push_str("}\n");
+
+    // Generate matching State class for StatefulWidget variants
+    if is_stateful {
+        stub.push('\n');
+        stub.push_str("class _");
+        stub.push_str(&class_name);
+        stub.push_str("State extends ");
+        if is_consumer {
+            stub.push_str("ConsumerState<");
+            stub.push_str(&class_name);
+            stub.push_str(">");
+        } else {
+            stub.push_str("State<");
+            stub.push_str(&class_name);
+            stub.push_str(">");
+        }
+        stub.push_str(" {\n");
+        stub.push_str("  @override\n");
+        stub.push_str("  Widget build(BuildContext context) => const SizedBox.shrink();\n");
+        stub.push_str("}\n");
+    }
+
+    stub
+}
+
+fn extract_class_name_from_decl(decl: &str) -> Option<String> {
+    let tokens: Vec<&str> = decl.split_whitespace().collect();
+    for (i, token) in tokens.iter().enumerate() {
+        if *token == "class" && i + 1 < tokens.len() {
+            return Some(tokens[i + 1].to_string());
+        }
+    }
+    None
 }
